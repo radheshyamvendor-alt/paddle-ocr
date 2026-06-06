@@ -32,6 +32,9 @@ NVIDIA_FALLBACK_MODELS = [
 ]
 NVIDIA_REQUEST_TIMEOUT = int(os.environ.get("NVIDIA_REQUEST_TIMEOUT", "45"))
 LOG_MODEL_RAW_OUTPUT = os.environ.get("LOG_MODEL_RAW_OUTPUT", "true").casefold() == "true"
+PDF_RENDER_DPI = int(os.environ.get("PDF_RENDER_DPI", "200"))
+MAX_IMAGE_WIDTH = int(os.environ.get("MAX_IMAGE_WIDTH", "1800"))
+APP_VERSION = "2026-06-06-nim-fast-preprocess-text-context"
 
 app = FastAPI(title="Radheshyam NVIDIA NIM Vision OCR Service")
 
@@ -42,6 +45,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def log_startup_config():
+    logger.info(
+        "startup: version=%s models=%s timeout=%s pdf_render_dpi=%s max_image_width=%s raw_output_logs=%s",
+        APP_VERSION,
+        get_nvidia_models(),
+        NVIDIA_REQUEST_TIMEOUT,
+        PDF_RENDER_DPI,
+        MAX_IMAGE_WIDTH,
+        LOG_MODEL_RAW_OUTPUT,
+    )
 
 
 EMPTY_RESPONSE = {
@@ -90,8 +106,8 @@ Rules:
 - Do not guess.
 - Do not add sample data.
 - Do not infer missing values.
-- Prescription means the prescription serial/number only. Prefer labels like Sr.No, Sr No, Serial No, Prescription No, Rx No, Bill No, Slip No, or Order No.
-- For ONGC-style slips, Prescription is Sr.No, for example 1000020419. Never use MSB-PAGE NO, page number, 2.0, card number, hospital, pharmacy, company, title, or location text as Prescription.
+- Prescription means the prescription serial/number only. Prefer nearby labels like Sr.No, Sr No, Serial No, Prescription No, Rx No, Bill No, Slip No, or Order No.
+- Do not use page number, card number, hospital, pharmacy, company, title, location, relation, category, diagnosis, or form text as Prescription.
 - Name means patient name only. Prefer labels like Name or Patient Name.
 - Address means patient address only. Prefer labels like Patient Address or Address.
 - Mobile means a phone/mobile number visible anywhere on the prescription. Use a visible 10-digit phone number if present, even if it appears near signature or attendant details.
@@ -99,7 +115,7 @@ Rules:
 - Age means Age.
 - Medicines must come only from medicine table rows or prescription medicine lines. Prefer columns named Medicine Name, Medi.Name, Drug, Item, or Medicine.
 - Qty must come only from columns or labels like Qty, Quantity, Qty-Prescribed, Qty-Presc., Day(s), or explicit medicine quantity text.
-- Never use Emp Catg, CAT EMP, Diagnosis, Card No, Location, Relation, Doctor Name, Chemist, Pharmacy, Form, TAB alone, CAP alone, or hospital title as a medicine.
+- Never use category, diagnosis, card, location, relation, doctor, chemist, pharmacy, form, route/form-only text, or hospital title as a medicine.
 - If a field is missing or unclear, return null.
 - If no medicines are visible, return an empty Medicines array.
 - Qty must be a number when visible, otherwise null.
@@ -124,14 +140,17 @@ def preprocess_image(image_bytes: bytes, request_id: str, page_label: str) -> by
         len(image_bytes),
     )
 
-    if width < 1600:
-        scale = 1600 / width
+    if width > MAX_IMAGE_WIDTH:
+        scale = MAX_IMAGE_WIDTH / width
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        logger.info("[%s] preprocessing %s: downscaled_with_scale=%.3f", request_id, page_label, scale)
+    elif width < 1200:
+        scale = 1200 / width
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        logger.info("[%s] preprocessing %s: resized_with_scale=%.3f", request_id, page_label, scale)
+        logger.info("[%s] preprocessing %s: upscaled_with_scale=%.3f", request_id, page_label, scale)
 
-    denoised = cv2.fastNlMeansDenoising(gray, None, h=8, templateWindowSize=7, searchWindowSize=21)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(denoised)
+    enhanced = clahe.apply(gray)
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     sharpened = cv2.filter2D(enhanced, -1, kernel)
 
@@ -149,7 +168,7 @@ def preprocess_image(image_bytes: bytes, request_id: str, page_label: str) -> by
     return output
 
 
-def file_to_page_images(file_bytes: bytes, content_type: Optional[str], request_id: str) -> list[bytes]:
+def file_to_page_inputs(file_bytes: bytes, content_type: Optional[str], request_id: str) -> list[dict[str, Any]]:
     started_at = time.perf_counter()
     is_pdf = content_type == "application/pdf" or file_bytes.startswith(b"%PDF")
     logger.info(
@@ -161,14 +180,14 @@ def file_to_page_images(file_bytes: bytes, content_type: Optional[str], request_
     )
 
     if not is_pdf:
-        images = [preprocess_image(file_bytes, request_id, "image")]
+        pages = [{"image": preprocess_image(file_bytes, request_id, "image"), "text": None}]
         logger.info(
             "[%s] image conversion complete: pages=%s elapsed_ms=%.1f",
             request_id,
-            len(images),
+            len(pages),
             (time.perf_counter() - started_at) * 1000,
         )
-        return images
+        return pages
 
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -176,27 +195,41 @@ def file_to_page_images(file_bytes: bytes, content_type: Optional[str], request_
         raise HTTPException(status_code=400, detail=f"Invalid PDF: {exc}") from exc
 
     logger.info("[%s] pdf opened: pages=%s", request_id, len(doc))
-    images = []
+    pages = []
     for page_num in range(len(doc)):
         page_started_at = time.perf_counter()
         page = doc.load_page(page_num)
-        pix = page.get_pixmap(dpi=300)
+        page_text = re.sub(r"\s+", " ", page.get_text("text")).strip() or None
         logger.info(
-            "[%s] rendered pdf page %s: pixmap=%sx%s elapsed_ms=%.1f",
+            "[%s] extracted pdf text page %s: chars=%s text=%s",
             request_id,
             page_num + 1,
+            len(page_text or ""),
+            page_text,
+        )
+        pix = page.get_pixmap(dpi=PDF_RENDER_DPI)
+        logger.info(
+            "[%s] rendered pdf page %s: dpi=%s pixmap=%sx%s elapsed_ms=%.1f",
+            request_id,
+            page_num + 1,
+            PDF_RENDER_DPI,
             pix.width,
             pix.height,
             (time.perf_counter() - page_started_at) * 1000,
         )
-        images.append(preprocess_image(pix.tobytes("png"), request_id, f"page_{page_num + 1}"))
+        pages.append(
+            {
+                "image": preprocess_image(pix.tobytes("png"), request_id, f"page_{page_num + 1}"),
+                "text": page_text,
+            }
+        )
     logger.info(
         "[%s] pdf conversion complete: pages=%s elapsed_ms=%.1f",
         request_id,
-        len(images),
+        len(pages),
         (time.perf_counter() - started_at) * 1000,
     )
-    return images
+    return pages
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -225,14 +258,23 @@ def get_nvidia_models() -> list[str]:
     return models
 
 
-def build_nvidia_payload(model: str, image_base64: str, use_json_mode: bool) -> dict[str, Any]:
+def build_nvidia_payload(model: str, image_base64: str, page_text: Optional[str], use_json_mode: bool) -> dict[str, Any]:
+    prompt = EXTRACTION_PROMPT
+    if page_text:
+        prompt = (
+            f"{EXTRACTION_PROMPT}\n\n"
+            "Additional OCR/PDF text extracted directly from this same page. "
+            "Use it only as supporting evidence for text visible in the image:\n"
+            f"{page_text}"
+        )
+
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": EXTRACTION_PROMPT},
+                    {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{image_base64}"},
@@ -252,7 +294,7 @@ def build_nvidia_payload(model: str, image_base64: str, use_json_mode: bool) -> 
     return payload
 
 
-def call_nvidia_vision(image_bytes: bytes, request_id: str, page_number: int) -> dict[str, Any]:
+def call_nvidia_vision(image_bytes: bytes, page_text: Optional[str], request_id: str, page_number: int) -> dict[str, Any]:
     api_key = os.environ.get("NVIDIA_API_KEY")
     if not api_key:
         raise RuntimeError("NVIDIA_API_KEY is missing. Add it to .env")
@@ -267,6 +309,13 @@ def call_nvidia_vision(image_bytes: bytes, request_id: str, page_number: int) ->
         get_nvidia_models(),
         NVIDIA_REQUEST_TIMEOUT,
     )
+    logger.info(
+        "[%s] page %s text context: chars=%s text=%s",
+        request_id,
+        page_number,
+        len(page_text or ""),
+        page_text,
+    )
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -277,7 +326,7 @@ def call_nvidia_vision(image_bytes: bytes, request_id: str, page_number: int) ->
     errors = []
     for model in get_nvidia_models():
         for use_json_mode in (True, False):
-            payload = build_nvidia_payload(model, image_base64, use_json_mode)
+            payload = build_nvidia_payload(model, image_base64, page_text, use_json_mode)
             started_at = time.perf_counter()
             logger.info(
                 "[%s] page %s nvidia attempt start: model=%s json_mode=%s",
@@ -519,15 +568,22 @@ async def run_ocr(file: UploadFile = File(...)):
     logger.info("[%s] upload read complete: bytes=%s", request_id, len(file_bytes))
 
     try:
-        page_images = file_to_page_images(file_bytes, file.content_type, request_id)
-        if not page_images:
+        page_inputs = file_to_page_inputs(file_bytes, file.content_type, request_id)
+        if not page_inputs:
             logger.warning("[%s] no page images generated", request_id)
             return {"success": False, "error": "Unable to extract text from prescription"}
 
         page_results = []
-        for index, image in enumerate(page_images, start=1):
-            logger.info("[%s] starting OCR for page %s/%s", request_id, index, len(page_images))
-            page_results.append(call_nvidia_vision(image, request_id, index))
+        for index, page_input in enumerate(page_inputs, start=1):
+            logger.info("[%s] starting OCR for page %s/%s", request_id, index, len(page_inputs))
+            page_results.append(
+                call_nvidia_vision(
+                    page_input["image"],
+                    page_input.get("text"),
+                    request_id,
+                    index,
+                )
+            )
 
         result = merge_page_results(page_results, request_id)
 
@@ -553,6 +609,11 @@ async def run_ocr(file: UploadFile = File(...)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "version": APP_VERSION}
 
 
 if __name__ == "__main__":
