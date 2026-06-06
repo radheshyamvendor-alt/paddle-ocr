@@ -19,8 +19,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize PaddleOCR with angle classifier enabled for auto orientation correction
-ocr = PaddleOCR(use_angle_cls=True, lang="en")
+# Lazy-loaded PaddleOCR instance to avoid memory warnings/OOM at startup on Render
+ocr_instance = None
+
+def get_ocr():
+    global ocr_instance
+    if ocr_instance is None:
+        ocr_instance = PaddleOCR(use_angle_cls=True, lang="en")
+    return ocr_instance
 
 def preprocess_image(image_bytes: bytes) -> np.ndarray:
     """
@@ -73,7 +79,7 @@ async def run_ocr(file: UploadFile = File(...)):
                     nparr = np.frombuffer(img_data, np.uint8)
                     preprocessed_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
-                result = ocr.ocr(preprocessed_bgr)
+                result = get_ocr().ocr(preprocessed_bgr)
                 if result and result[0]:
                     for line in result[0]:
                         box, (text, confidence) = line
@@ -89,7 +95,7 @@ async def run_ocr(file: UploadFile = File(...)):
                 if preprocessed_bgr is None:
                     raise HTTPException(status_code=400, detail="Invalid image format")
             
-            result = ocr.ocr(preprocessed_bgr)
+            result = get_ocr().ocr(preprocessed_bgr)
             if result and result[0]:
                 for line in result[0]:
                     box, (text, confidence) = line
