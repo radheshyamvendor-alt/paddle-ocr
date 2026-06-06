@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install CPU-based paddlepaddle first to ensure correctness on CPU-only container host
-RUN pip install --no-cache-dir paddlepaddle==2.6.1
+RUN pip install --no-cache-dir paddlepaddle==2.6.2
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
