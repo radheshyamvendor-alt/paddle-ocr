@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Install system dependencies required by OpenCV and PaddlePaddle
+# Install system dependencies required by OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
@@ -13,7 +13,6 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN pip install --upgrade pip
-RUN pip install --no-cache-dir paddlepaddle==2.6.2
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy service code
