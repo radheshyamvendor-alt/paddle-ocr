@@ -20,7 +20,7 @@ app.add_middleware(
 )
 
 # Initialize PaddleOCR with angle classifier enabled for auto orientation correction
-ocr = PaddleOCR(use_angle_cls=True, lang="en", enable_mkldnn=False)
+ocr = PaddleOCR(use_angle_cls=True, lang="en")
 
 def preprocess_image(image_bytes: bytes) -> np.ndarray:
     """

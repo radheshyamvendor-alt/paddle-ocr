@@ -1,8 +1,10 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart
-paddleocr==3.0.3
-paddlepaddle==3.1.1
+
+paddleocr==2.7.3
+paddlepaddle==2.6.2
+
 opencv-python-headless
-numpy
+numpy<2
 pymupdf==1.24.5
