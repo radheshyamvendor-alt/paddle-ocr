@@ -45,6 +45,8 @@ http://127.0.0.1:8000/health
 
 `/ready` additionally verifies that at least one model provider key is configured.
 
+For Render, set the health-check path to `/health`. Both `/` and `/health` accept GET and HEAD probes, and the service binds to Render's injected `PORT` automatically.
+
 ## Production configuration
 
 - Keep `LOG_MODEL_RAW_OUTPUT=false` to avoid logging patient data.

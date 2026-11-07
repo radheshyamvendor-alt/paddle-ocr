@@ -16,6 +16,13 @@ def response(content, model="test/model"):
 
 
 class ModelFallbackTests(unittest.TestCase):
+    def test_render_head_probes_are_accepted(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(main.app)
+        self.assertEqual(client.head("/").status_code, 200)
+        self.assertEqual(client.head("/health").status_code, 200)
+
     def test_frontend_response_has_no_duplicate_data_wrapper(self):
         response = main.build_frontend_response(
             {

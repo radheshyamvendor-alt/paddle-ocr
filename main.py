@@ -724,7 +724,7 @@ def run_ocr(file: UploadFile = File(...)):
         ocr_slots.release()
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok"}
 
@@ -741,7 +741,7 @@ def ready():
     return {"status": "ready"}
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "ok", "version": APP_VERSION}
 
