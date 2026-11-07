@@ -2,9 +2,12 @@ import base64
 import json
 import logging
 import os
+import random
 import re
+import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import cv2
@@ -24,40 +27,83 @@ logging.basicConfig(
 logger = logging.getLogger("ocr-service")
 
 NVIDIA_INVOKE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "meta/llama-3.2-11b-vision-instruct")
-NVIDIA_FALLBACK_MODELS = [
+GOOGLE_INVOKE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+OPENROUTER_INVOKE_URL = "https://openrouter.ai/api/v1/chat/completions"
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b")
+OPENROUTER_MODELS = [
     model.strip()
-    for model in os.environ.get("NVIDIA_FALLBACK_MODELS", "meta/llama-3.2-90b-vision-instruct").split(",")
+    for model in os.environ.get(
+        "OPENROUTER_MODELS",
+        "google/gemini-3.8-flash,google/gemini-3-flash-preview",
+    ).split(",")
     if model.strip()
 ]
+GOOGLE_MODELS = [
+    model.strip()
+    for model in os.environ.get(
+        "GOOGLE_MODELS",
+        "gemini-3.6-flash",
+    ).split(",")
+    if model.strip()
+]
+MODEL_PROVIDER_ORDER = [
+    provider.strip().casefold()
+    for provider in os.environ.get("MODEL_PROVIDER_ORDER", "google,nvidia,openrouter").split(",")
+    if provider.strip()
+]
 NVIDIA_REQUEST_TIMEOUT = int(os.environ.get("NVIDIA_REQUEST_TIMEOUT", "45"))
-LOG_MODEL_RAW_OUTPUT = os.environ.get("LOG_MODEL_RAW_OUTPUT", "true").casefold() == "true"
+MODEL_MAX_RETRIES = int(os.environ.get("MODEL_MAX_RETRIES", "2"))
+RETRY_BASE_SECONDS = float(os.environ.get("RETRY_BASE_SECONDS", "0.5"))
+LOG_MODEL_RAW_OUTPUT = os.environ.get("LOG_MODEL_RAW_OUTPUT", "false").casefold() == "true"
 PDF_RENDER_DPI = int(os.environ.get("PDF_RENDER_DPI", "200"))
 MAX_IMAGE_WIDTH = int(os.environ.get("MAX_IMAGE_WIDTH", "1800"))
-APP_VERSION = "2026-06-06-nim-fast-preprocess-text-context"
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))
+MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "10"))
+MAX_RENDERED_PIXELS = int(os.environ.get("MAX_RENDERED_PIXELS", "25000000"))
+MAX_CONCURRENT_OCR = int(os.environ.get("MAX_CONCURRENT_OCR", "4"))
+MAX_OCR_SECONDS = int(os.environ.get("MAX_OCR_SECONDS", "180"))
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+APP_VERSION = "2026-11-08-production-fallbacks"
+ocr_slots = threading.BoundedSemaphore(MAX_CONCURRENT_OCR)
 
-app = FastAPI(title="Radheshyam NVIDIA NIM Vision OCR Service")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class ModelProvidersUnavailable(RuntimeError):
+    pass
 
-
-@app.on_event("startup")
-def log_startup_config():
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     logger.info(
-        "startup: version=%s models=%s timeout=%s pdf_render_dpi=%s max_image_width=%s raw_output_logs=%s",
+        "startup: version=%s nvidia_models=%s google_models=%s openrouter_models=%s timeout=%s "
+        "pdf_render_dpi=%s max_image_width=%s max_upload_bytes=%s max_pdf_pages=%s "
+        "max_concurrent_ocr=%s raw_output_logs=%s",
         APP_VERSION,
         get_nvidia_models(),
+        GOOGLE_MODELS,
+        OPENROUTER_MODELS,
         NVIDIA_REQUEST_TIMEOUT,
         PDF_RENDER_DPI,
         MAX_IMAGE_WIDTH,
+        MAX_UPLOAD_BYTES,
+        MAX_PDF_PAGES,
+        MAX_CONCURRENT_OCR,
         LOG_MODEL_RAW_OUTPUT,
     )
+    yield
+
+
+app = FastAPI(title="Radheshyam Prescription OCR Service", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_credentials="*" not in CORS_ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 EMPTY_RESPONSE = {
@@ -110,7 +156,9 @@ Rules:
 - Do not use page number, card number, hospital, pharmacy, company, title, location, relation, category, diagnosis, or form text as Prescription.
 - Name means patient name only. Prefer labels like Name or Patient Name.
 - Address means patient address only. Prefer labels like Patient Address or Address.
-- Mobile means a phone/mobile number visible anywhere on the prescription. Use a visible 10-digit phone number if present, even if it appears near signature or attendant details.
+- Mobile means the patient's phone/mobile number only. Accept it only when it is clearly associated with the patient or a patient field such as Mobile, Phone, Contact, Patient Mobile, or Patient Phone.
+- Never use a phone number belonging to a beneficiary, attendant, relative, guardian, doctor, hospital, pharmacy, signature block, or Beneficiary/Attendant Signature section.
+- If the only visible phone number is in or near a Beneficiary/Attendant Signature section, return Mobile as null.
 - Gender means Sex or Gender.
 - Age means Age.
 - Medicines must come only from medicine table rows or prescription medicine lines. Prefer columns named Medicine Name, Medi.Name, Drug, Item, or Medicine.
@@ -131,6 +179,8 @@ def preprocess_image(image_bytes: bytes, request_id: str, page_label: str) -> by
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape[:2]
+    if height * width > MAX_RENDERED_PIXELS:
+        raise HTTPException(status_code=413, detail="Image dimensions are too large")
     logger.info(
         "[%s] preprocessing %s: original_size=%sx%s input_bytes=%s",
         request_id,
@@ -194,35 +244,49 @@ def file_to_page_inputs(file_bytes: bytes, content_type: Optional[str], request_
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid PDF: {exc}") from exc
 
+    if len(doc) == 0:
+        doc.close()
+        raise HTTPException(status_code=400, detail="PDF contains no pages")
+    if len(doc) > MAX_PDF_PAGES:
+        doc.close()
+        raise HTTPException(status_code=413, detail=f"PDF exceeds the {MAX_PDF_PAGES}-page limit")
+
     logger.info("[%s] pdf opened: pages=%s", request_id, len(doc))
     pages = []
-    for page_num in range(len(doc)):
-        page_started_at = time.perf_counter()
-        page = doc.load_page(page_num)
-        page_text = re.sub(r"\s+", " ", page.get_text("text")).strip() or None
-        logger.info(
-            "[%s] extracted pdf text page %s: chars=%s text=%s",
-            request_id,
-            page_num + 1,
-            len(page_text or ""),
-            page_text,
-        )
-        pix = page.get_pixmap(dpi=PDF_RENDER_DPI)
-        logger.info(
-            "[%s] rendered pdf page %s: dpi=%s pixmap=%sx%s elapsed_ms=%.1f",
-            request_id,
-            page_num + 1,
-            PDF_RENDER_DPI,
-            pix.width,
-            pix.height,
-            (time.perf_counter() - page_started_at) * 1000,
-        )
-        pages.append(
-            {
-                "image": preprocess_image(pix.tobytes("png"), request_id, f"page_{page_num + 1}"),
-                "text": page_text,
-            }
-        )
+    try:
+        for page_num in range(len(doc)):
+            page_started_at = time.perf_counter()
+            page = doc.load_page(page_num)
+            scale = PDF_RENDER_DPI / 72
+            estimated_pixels = int(page.rect.width * scale) * int(page.rect.height * scale)
+            if estimated_pixels > MAX_RENDERED_PIXELS:
+                raise HTTPException(status_code=413, detail="PDF page dimensions are too large")
+
+            page_text = re.sub(r"\s+", " ", page.get_text("text")).strip() or None
+            logger.info(
+                "[%s] extracted pdf text page %s: chars=%s",
+                request_id,
+                page_num + 1,
+                len(page_text or ""),
+            )
+            pix = page.get_pixmap(dpi=PDF_RENDER_DPI)
+            logger.info(
+                "[%s] rendered pdf page %s: dpi=%s pixmap=%sx%s elapsed_ms=%.1f",
+                request_id,
+                page_num + 1,
+                PDF_RENDER_DPI,
+                pix.width,
+                pix.height,
+                (time.perf_counter() - page_started_at) * 1000,
+            )
+            pages.append(
+                {
+                    "image": preprocess_image(pix.tobytes("png"), request_id, f"page_{page_num + 1}"),
+                    "text": page_text,
+                }
+            )
+    finally:
+        doc.close()
     logger.info(
         "[%s] pdf conversion complete: pages=%s elapsed_ms=%.1f",
         request_id,
@@ -232,7 +296,9 @@ def file_to_page_inputs(file_bytes: bytes, content_type: Optional[str], request_
     return pages
 
 
-def extract_json_object(text: str) -> dict[str, Any]:
+def extract_json_object(text: Optional[str]) -> dict[str, Any]:
+    if not isinstance(text, str) or not text:
+        return {}
     text = text.strip()
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
 
@@ -251,14 +317,16 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 
 def get_nvidia_models() -> list[str]:
-    models = []
-    for model in [NVIDIA_MODEL, *NVIDIA_FALLBACK_MODELS]:
-        if model and model not in models:
-            models.append(model)
-    return models
+    return [NVIDIA_MODEL] if NVIDIA_MODEL else []
 
 
-def build_nvidia_payload(model: str, image_base64: str, page_text: Optional[str], use_json_mode: bool) -> dict[str, Any]:
+def build_model_payload(
+    model: str,
+    image_base64: str,
+    page_text: Optional[str],
+    use_json_mode: bool,
+    provider: str,
+) -> dict[str, Any]:
     prompt = EXTRACTION_PROMPT
     if page_text:
         prompt = (
@@ -288,150 +356,167 @@ def build_nvidia_payload(model: str, image_base64: str, page_text: Optional[str]
         "stream": False,
     }
 
+    if provider == "google":
+        payload.pop("temperature", None)
+        payload.pop("top_p", None)
+        payload["max_tokens"] = 4096
+
     if use_json_mode:
         payload["response_format"] = {"type": "json_object"}
+
+    if provider == "nvidia" and model.startswith("nvidia/nemotron-3.5-"):
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    if provider == "openrouter":
+        payload["provider"] = {"allow_fallbacks": True}
+        payload["reasoning"] = (
+            {"effort": "low"}
+            if model == "google/gemini-3.8-flash"
+            else {"enabled": False}
+        )
 
     return payload
 
 
-def call_nvidia_vision(image_bytes: bytes, page_text: Optional[str], request_id: str, page_number: int) -> dict[str, Any]:
-    api_key = os.environ.get("NVIDIA_API_KEY")
-    if not api_key:
-        raise RuntimeError("NVIDIA_API_KEY is missing. Add it to .env")
-
+def call_vision_models(
+    image_bytes: bytes,
+    page_text: Optional[str],
+    request_id: str,
+    page_number: int,
+    deadline: Optional[float] = None,
+) -> dict[str, Any]:
     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    available_providers = {}
+    nvidia_key = os.environ.get("NVIDIA_API_KEY")
+    google_key = os.environ.get("GEMINI_API_KEY")
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if nvidia_key:
+        available_providers["nvidia"] = ("nvidia", NVIDIA_INVOKE_URL, nvidia_key, get_nvidia_models())
+    if google_key and GOOGLE_MODELS:
+        available_providers["google"] = ("google", GOOGLE_INVOKE_URL, google_key, GOOGLE_MODELS)
+    if openrouter_key and OPENROUTER_MODELS:
+        available_providers["openrouter"] = (
+            "openrouter",
+            OPENROUTER_INVOKE_URL,
+            openrouter_key,
+            OPENROUTER_MODELS,
+        )
+    providers = [available_providers[name] for name in MODEL_PROVIDER_ORDER if name in available_providers]
+    if not providers:
+        raise ModelProvidersUnavailable("No model provider API key is configured")
+
     logger.info(
-        "[%s] page %s nvidia call prepared: image_bytes=%s image_base64_chars=%s models=%s timeout_seconds=%s",
+        "[%s] page %s model call prepared: image_bytes=%s providers=%s timeout_seconds=%s",
         request_id,
         page_number,
         len(image_bytes),
-        len(image_base64),
-        get_nvidia_models(),
+        [provider[0] for provider in providers],
         NVIDIA_REQUEST_TIMEOUT,
     )
     logger.info(
-        "[%s] page %s text context: chars=%s text=%s",
+        "[%s] page %s text context: chars=%s",
         request_id,
         page_number,
         len(page_text or ""),
-        page_text,
     )
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
     errors = []
-    for model in get_nvidia_models():
-        for use_json_mode in (True, False):
-            payload = build_nvidia_payload(model, image_base64, page_text, use_json_mode)
-            started_at = time.perf_counter()
-            logger.info(
-                "[%s] page %s nvidia attempt start: model=%s json_mode=%s",
-                request_id,
-                page_number,
-                model,
-                use_json_mode,
-            )
-            try:
-                response = requests.post(
-                    NVIDIA_INVOKE_URL,
-                    headers=headers,
-                    json=payload,
-                    timeout=NVIDIA_REQUEST_TIMEOUT,
-                )
-                elapsed_ms = (time.perf_counter() - started_at) * 1000
-                logger.info(
-                    "[%s] page %s nvidia attempt response: model=%s json_mode=%s status=%s elapsed_ms=%.1f",
-                    request_id,
-                    page_number,
-                    model,
-                    use_json_mode,
-                    response.status_code,
-                    elapsed_ms,
-                )
-                response.raise_for_status()
+    for provider, url, api_key, models in providers:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if provider == "google":
+            headers["x-goog-api-client"] = f"radheshyam-ocr/{APP_VERSION}"
+        for model in models:
+            for use_json_mode in (True, False):
+                payload = build_model_payload(model, image_base64, page_text, use_json_mode, provider)
+                for retry in range(MODEL_MAX_RETRIES + 1):
+                    if deadline is not None and time.perf_counter() >= deadline:
+                        raise ModelProvidersUnavailable("OCR request deadline exceeded")
+                    started_at = time.perf_counter()
+                    read_timeout = NVIDIA_REQUEST_TIMEOUT
+                    if deadline is not None:
+                        read_timeout = max(1, min(read_timeout, deadline - started_at))
+                    try:
+                        response = requests.post(
+                            url,
+                            headers=headers,
+                            json=payload,
+                            timeout=(5, read_timeout),
+                        )
+                        elapsed_ms = (time.perf_counter() - started_at) * 1000
+                        logger.info(
+                            "[%s] page %s model response: provider=%s model=%s json_mode=%s "
+                            "status=%s retry=%s elapsed_ms=%.1f",
+                            request_id,
+                            page_number,
+                            provider,
+                            model,
+                            use_json_mode,
+                            response.status_code,
+                            retry,
+                            elapsed_ms,
+                        )
+                        if response.status_code in {408, 429, 500, 502, 503, 504}:
+                            raise requests.HTTPError(response=response)
+                        response.raise_for_status()
 
-                data = response.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                usage = data.get("usage")
-                logger.info(
-                    "[%s] page %s nvidia usage: model=%s usage=%s",
-                    request_id,
-                    page_number,
-                    model,
-                    json.dumps(usage, ensure_ascii=False) if usage else None,
-                )
-                if LOG_MODEL_RAW_OUTPUT:
-                    logger.info(
-                        "[%s] page %s nvidia raw output: model=%s content=%s",
-                        request_id,
-                        page_number,
-                        model,
-                        content,
-                    )
-                parsed = extract_json_object(content)
-                if parsed:
-                    logger.info(
-                        "[%s] page %s nvidia parsed output: model=%s parsed=%s",
-                        request_id,
-                        page_number,
-                        model,
-                        json.dumps(parsed, ensure_ascii=False),
-                    )
-                    return parsed
+                        data = response.json()
+                        choices = data.get("choices") or []
+                        content = choices[0].get("message", {}).get("content") if choices else None
+                        parsed = extract_json_object(content)
+                        logger.info(
+                            "[%s] page %s model usage: provider=%s model=%s usage=%s",
+                            request_id,
+                            page_number,
+                            provider,
+                            data.get("model", model),
+                            json.dumps(data.get("usage"), ensure_ascii=False) if data.get("usage") else None,
+                        )
+                        if LOG_MODEL_RAW_OUTPUT:
+                            logger.info(
+                                "[%s] page %s model raw output: provider=%s model=%s content=%s",
+                                request_id,
+                                page_number,
+                                provider,
+                                model,
+                                content,
+                            )
+                        if parsed:
+                            return parsed
 
-                errors.append(f"{model}: empty JSON response")
-                logger.warning(
-                    "[%s] page %s nvidia attempt failed: model=%s reason=empty_json_response",
-                    request_id,
-                    page_number,
-                    model,
-                )
-                break
-            except requests.Timeout:
-                errors.append(f"{model}: request timed out")
-                logger.warning(
-                    "[%s] page %s nvidia attempt timed out: model=%s json_mode=%s timeout_seconds=%s elapsed_ms=%.1f",
-                    request_id,
-                    page_number,
-                    model,
-                    use_json_mode,
-                    NVIDIA_REQUEST_TIMEOUT,
-                    (time.perf_counter() - started_at) * 1000,
-                )
-                break
-            except requests.HTTPError as exc:
-                status_code = exc.response.status_code if exc.response is not None else None
-                response_text = exc.response.text if exc.response is not None else ""
-                errors.append(f"{model}: HTTP {status_code}")
-                logger.warning(
-                    "[%s] page %s nvidia attempt http error: model=%s json_mode=%s status=%s body=%s",
-                    request_id,
-                    page_number,
-                    model,
-                    use_json_mode,
-                    status_code,
-                    response_text,
-                )
-                if status_code not in {400, 422} or not use_json_mode:
-                    break
-            except requests.RequestException as exc:
-                errors.append(f"{model}: {exc}")
-                logger.warning(
-                    "[%s] page %s nvidia attempt request error: model=%s json_mode=%s error=%s",
-                    request_id,
-                    page_number,
-                    model,
-                    use_json_mode,
-                    exc,
-                )
-                break
+                        errors.append(f"{provider}/{model}: invalid JSON")
+                        logger.warning(
+                            "[%s] page %s unusable model output: provider=%s model=%s",
+                            request_id,
+                            page_number,
+                            provider,
+                            model,
+                        )
+                        break
+                    except (requests.Timeout, requests.ConnectionError) as exc:
+                        errors.append(f"{provider}/{model}: {type(exc).__name__}")
+                        if retry >= MODEL_MAX_RETRIES:
+                            break
+                    except requests.HTTPError as exc:
+                        status = exc.response.status_code if exc.response is not None else None
+                        errors.append(f"{provider}/{model}: HTTP {status}")
+                        if status not in {408, 429, 500, 502, 503, 504} or retry >= MODEL_MAX_RETRIES:
+                            break
+                        retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
+                        if retry_after and retry_after.isdigit():
+                            time.sleep(min(float(retry_after), 10))
+                            continue
+                    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+                        errors.append(f"{provider}/{model}: {type(exc).__name__}")
+                        break
 
-    logger.error("[%s] page %s all nvidia models failed: errors=%s", request_id, page_number, errors)
-    raise RuntimeError("All NVIDIA vision models failed: " + "; ".join(errors))
+                    delay = RETRY_BASE_SECONDS * (2**retry) + random.uniform(0, RETRY_BASE_SECONDS)
+                    time.sleep(min(delay, 10))
+
+    logger.error("[%s] page %s all model providers failed: errors=%s", request_id, page_number, errors)
+    raise ModelProvidersUnavailable("All configured vision models failed")
 
 
 def clean_string(value: Any) -> Optional[str]:
@@ -486,11 +571,7 @@ def normalize_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def merge_page_results(page_results: list[dict[str, Any]], request_id: str) -> dict[str, Any]:
-    logger.info(
-        "[%s] merging page results: page_results=%s",
-        request_id,
-        json.dumps(page_results, ensure_ascii=False),
-    )
+    logger.info("[%s] merging page results: pages=%s", request_id, len(page_results))
     merged = {
         "success": True,
         "Name": None,
@@ -505,7 +586,6 @@ def merge_page_results(page_results: list[dict[str, Any]], request_id: str) -> d
 
     for result in page_results:
         normalized = normalize_result(result)
-        logger.info("[%s] normalized page result: %s", request_id, json.dumps(normalized, ensure_ascii=False))
         for field in ("Name", "Prescription", "Address", "Mobile", "Gender", "Age"):
             if merged[field] is None and normalized[field] is not None:
                 merged[field] = normalized[field]
@@ -516,7 +596,7 @@ def merge_page_results(page_results: list[dict[str, Any]], request_id: str) -> d
                 merged["Medicines"].append(medicine)
                 seen_medicines.add(key)
 
-    logger.info("[%s] merged result: %s", request_id, json.dumps(merged, ensure_ascii=False))
+    logger.info("[%s] merged result: medicines=%s", request_id, len(merged["Medicines"]))
     return merged
 
 
@@ -548,40 +628,66 @@ def build_frontend_response(result: dict[str, Any], request_id: str) -> dict[str
     response = {
         "success": True,
         **data,
-        "data": data,
     }
-    logger.info("[%s] frontend response: %s", request_id, json.dumps(response, ensure_ascii=False))
+    logger.info("[%s] frontend response built: medicines=%s", request_id, len(medicines))
     return response
 
 
 @app.post("/ocr")
-async def run_ocr(file: UploadFile = File(...)):
+def run_ocr(file: UploadFile = File(...)):
     request_id = uuid.uuid4().hex[:12]
     started_at = time.perf_counter()
+    deadline = started_at + MAX_OCR_SECONDS
     logger.info(
-        "[%s] /ocr request start: filename=%s content_type=%s",
+        "[%s] /ocr request start: content_type=%s",
         request_id,
-        file.filename,
         file.content_type,
     )
-    file_bytes = await file.read()
-    logger.info("[%s] upload read complete: bytes=%s", request_id, len(file_bytes))
 
+    if not ocr_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail={"error": "OCR service is busy", "requestId": request_id},
+            headers={"Retry-After": "2"},
+        )
     try:
+        file_bytes = file.file.read(MAX_UPLOAD_BYTES + 1)
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail={"error": "Uploaded file is empty", "requestId": request_id})
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={"error": f"Upload exceeds the {MAX_UPLOAD_BYTES}-byte limit", "requestId": request_id},
+            )
+
+        is_pdf = file_bytes.startswith(b"%PDF")
+        is_jpeg = file_bytes.startswith(b"\xff\xd8\xff")
+        is_png = file_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+        is_webp = len(file_bytes) >= 12 and file_bytes[:4] == b"RIFF" and file_bytes[8:12] == b"WEBP"
+        if not any((is_pdf, is_jpeg, is_png, is_webp)):
+            raise HTTPException(
+                status_code=415,
+                detail={"error": "Only PDF, JPG, PNG, and WEBP files are supported", "requestId": request_id},
+            )
+
+        logger.info("[%s] upload validated: bytes=%s", request_id, len(file_bytes))
         page_inputs = file_to_page_inputs(file_bytes, file.content_type, request_id)
         if not page_inputs:
-            logger.warning("[%s] no page images generated", request_id)
-            return {"success": False, "error": "Unable to extract text from prescription"}
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "Unable to read the prescription", "requestId": request_id},
+            )
 
         page_results = []
         for index, page_input in enumerate(page_inputs, start=1):
             logger.info("[%s] starting OCR for page %s/%s", request_id, index, len(page_inputs))
             page_results.append(
-                call_nvidia_vision(
+                call_vision_models(
                     page_input["image"],
                     page_input.get("text"),
                     request_id,
                     index,
+                    deadline,
                 )
             )
 
@@ -590,25 +696,49 @@ async def run_ocr(file: UploadFile = File(...)):
         has_any_data = any(result[field] is not None for field in ("Name", "Prescription", "Address", "Mobile", "Gender", "Age"))
         if not has_any_data and not result["Medicines"]:
             logger.warning("[%s] no extractable data after merge", request_id)
-            return {"success": False, "error": "Unable to extract text from prescription"}
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "No prescription data could be extracted", "requestId": request_id},
+            )
 
         response = build_frontend_response(result, request_id)
         logger.info("[%s] /ocr request complete: elapsed_ms=%.1f", request_id, (time.perf_counter() - started_at) * 1000)
         return response
-    except HTTPException:
-        logger.exception("[%s] /ocr request failed with HTTPException", request_id)
+    except HTTPException as exc:
+        logger.warning("[%s] /ocr request rejected: status=%s", request_id, exc.status_code)
         raise
-    except requests.HTTPError as exc:
-        logger.exception("[%s] /ocr request failed with NVIDIA HTTPError", request_id)
-        return {"success": False, "error": f"NVIDIA OCR request failed: {exc}"}
-    except Exception as exc:
+    except ModelProvidersUnavailable:
+        logger.exception("[%s] all model providers unavailable", request_id)
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "OCR providers are temporarily unavailable", "requestId": request_id},
+            headers={"Retry-After": "5"},
+        )
+    except Exception:
         logger.exception("[%s] /ocr request failed", request_id)
-        return {"success": False, "error": f"OCR extraction failed: {exc}"}
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "OCR processing failed", "requestId": request_id},
+        )
+    finally:
+        ocr_slots.release()
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    configured = bool(
+        os.environ.get("NVIDIA_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("OPENROUTER_API_KEY")
+    )
+    if not configured:
+        raise HTTPException(status_code=503, detail="No OCR model provider is configured")
+    return {"status": "ready"}
 
 
 @app.get("/")
@@ -620,4 +750,5 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    workers = 1 if os.name == "nt" else int(os.environ.get("WEB_CONCURRENCY", "1"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=workers)
